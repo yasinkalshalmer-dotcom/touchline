@@ -1,20 +1,44 @@
-"""Fixtures and results ingestion: every match FotMob lists for a date, worldwide, men's and women's."""
+"""Fixtures and results ingestion from two worldwide sources, merged without duplicates:
+FotMob (primary ids, scores) and SoccerVista (wider coverage, team form, its own predictions)."""
+import hashlib
 import json
+import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
 
 from tl_db import connect
-from tl_geo import confederation, gender
+from tl_geo import confederation, confederation_iso2, gender
+from tl_tipsters import _key, _sim
 
 FOTMOB = "https://www.fotmob.com/api/data/matches?date={ymd}"
+SOCCERVISTA = "https://www.soccervista.com/events/by/date/{dmy}/"
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
                   "Chrome/128.0 Safari/537.36",
     "Accept": "application/json",
 }
+SV_HEADERS = {**HEADERS, "X-Requested-With": "XMLHttpRequest", "Referer": "https://www.soccervista.com/"}
 PICKS_DIR = Path(__file__).resolve().parent
+FORM = {"win": "W", "draw": "D", "lost": "L", "loss": "L"}
+
+
+def _get_json(url: str, headers: dict, tries: int = 3):
+    for i in range(tries):
+        try:
+            r = requests.get(url, headers=headers, timeout=45)
+            r.raise_for_status()
+            return r.json()
+        except (requests.RequestException, ValueError):
+            if i == tries - 1:
+                raise
+            time.sleep(2 + 3 * i)
+
+
+def _stable_id(prefix: str, key: str) -> int:
+    """Negative 60-bit id for non-FotMob rows, so it never collides with FotMob's positive ids."""
+    return -int(hashlib.sha1(f"{prefix}:{key}".encode()).hexdigest()[:15], 16)
 
 
 def _status(s: dict) -> str:
@@ -27,10 +51,8 @@ def _status(s: dict) -> str:
     return "NS"
 
 
-def fetch_day(d: date) -> int:
-    r = requests.get(FOTMOB.format(ymd=d.strftime("%Y%m%d")), headers=HEADERS, timeout=40)
-    r.raise_for_status()
-    data = r.json()
+def fetch_fotmob(d: date) -> int:
+    data = _get_json(FOTMOB.format(ymd=d.strftime("%Y%m%d")), HEADERS)
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     con = connect()
     n = 0
@@ -50,19 +72,117 @@ def fetch_day(d: date) -> int:
             )
             for m in lg.get("matches", []):
                 s = m.get("status") or {}
-                st = _status(s)
                 played = s.get("started") or s.get("finished")
                 con.execute(
                     "INSERT INTO matches (id,match_date,kickoff_utc,competition_id,home,away,home_id,away_id,"
-                    "status,home_score,away_score,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?) "
+                    "status,home_score,away_score,updated_at,source) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'fotmob') "
                     "ON CONFLICT(id) DO UPDATE SET match_date=excluded.match_date, kickoff_utc=excluded.kickoff_utc, "
                     "status=excluded.status, home_score=excluded.home_score, away_score=excluded.away_score, "
                     "updated_at=excluded.updated_at",
                     (m["id"], d.isoformat(), s.get("utcTime"), lg["id"],
-                     m["home"]["name"], m["away"]["name"], m["home"].get("id"), m["away"].get("id"), st,
+                     m["home"]["name"], m["away"]["name"], m["home"].get("id"), m["away"].get("id"), _status(s),
                      m["home"].get("score") if played else None, m["away"].get("score") if played else None, now),
                 )
                 n += 1
+    return n
+
+
+def _sv_status(e: dict) -> str:
+    if e.get("isCancelled"):
+        return "Cancelled"
+    if e.get("isPostponed"):
+        return "Pst"
+    if e.get("isFinished"):
+        return "FT"
+    if e.get("isLive") or e.get("isPaused"):
+        return "Live"
+    return "NS"
+
+
+def fetch_soccervista(d: date) -> int:
+    """Add SoccerVista matches for a date. A match FotMob already has only gains team form and
+    SoccerVista's tips; anything FotMob lacks is inserted as a new row."""
+    data = _get_json(SOCCERVISTA.format(dmy=d.strftime("%d-%m-%Y")), SV_HEADERS)
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    con = connect()
+    days = [(d + timedelta(days=o)).isoformat() for o in (-1, 0, 1)]
+    existing = con.execute(
+        "SELECT id, kickoff_utc, home, away FROM matches WHERE source='fotmob' AND match_date IN (?,?,?)", days).fetchall()
+    ex = [(mid, datetime.fromisoformat(k.replace("Z", "+00:00")) if k else None, _key(h), _key(a))
+          for mid, k, h, a in existing]
+    n = 0
+    with con:
+        for comp in data if isinstance(data, list) else []:
+            cname = comp.get("name") or ""
+            country = comp.get("countryName") or ""
+            full = f"{country}: {cname}" if country else cname
+            cid = _stable_id("svc", comp.get("tournamentTemplateId") or comp.get("id") or full)
+            con.execute(
+                "INSERT INTO competitions (id,name,country_code,confederation,gender) VALUES (?,?,?,?,?) "
+                "ON CONFLICT(id) DO UPDATE SET name=excluded.name, country_code=excluded.country_code, "
+                "confederation=excluded.confederation, gender=excluded.gender",
+                (cid, cname, (comp.get("countryCode") or country[:3]).upper(),
+                 confederation_iso2(comp.get("countryCode") or "", country, cname), gender(cname)),
+            )
+            for e in comp.get("events", []):
+                ko = datetime.fromtimestamp(int(e["timeStart"]), tz=timezone.utc) if e.get("timeStart") else None
+                hk, ak = _key(e["homeTeam"]), _key(e["awayTeam"])
+                match_id = None
+                for mid, k, fh, fa in ex:
+                    if ko and k and abs((ko - k).total_seconds()) > 3 * 3600:
+                        continue
+                    if min(_sim(hk, fh), _sim(ak, fa)) >= 0.72:
+                        match_id = mid
+                        break
+                hf = "".join(FORM.get(x, "") for x in (e.get("homeTeamForm") or []))
+                af = "".join(FORM.get(x, "") for x in (e.get("awayTeamForm") or []))
+                hs = as_ = None
+                if e.get("score") and ":" in str(e["score"]):
+                    try:
+                        hs, as_ = (int(x) for x in str(e["score"]).split(":")[:2])
+                    except ValueError:
+                        pass
+                if match_id is not None:
+                    con.execute("UPDATE matches SET home_form=?, away_form=?, country_name=COALESCE(country_name, ?) "
+                                "WHERE id=?", (hf, af, country, match_id))
+                else:
+                    match_id = _stable_id("sve", e["id"])
+                    con.execute(
+                        "INSERT INTO matches (id,match_date,kickoff_utc,competition_id,home,away,status,home_score,"
+                        "away_score,updated_at,source,home_form,away_form,country_name) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,'soccervista',?,?,?) ON CONFLICT(id) DO UPDATE SET "
+                        "match_date=excluded.match_date, kickoff_utc=excluded.kickoff_utc, status=excluded.status, "
+                        "home_score=excluded.home_score, away_score=excluded.away_score, updated_at=excluded.updated_at, "
+                        "home_form=excluded.home_form, away_form=excluded.away_form",
+                        (match_id, (ko.date() if ko else d).isoformat(), ko.isoformat() if ko else None, cid,
+                         e["homeTeam"], e["awayTeam"], _sv_status(e), hs, as_, now, hf, af, country),
+                    )
+                    n += 1
+                tips = []
+                p1 = str(e.get("prediction1x2") or "").upper()
+                if p1 in ("1", "X", "2"):
+                    tips.append(("Match result", {"1": "Home win", "X": "Draw", "2": "Away win"}[p1]))
+                ou = str(e.get("predictionOu") or "").upper()
+                if ou in ("O", "U"):
+                    tips.append(("Over/Under goals", "Over 2.5" if ou == "O" else "Under 2.5"))
+                ps = str(e.get("predictionScore") or "")
+                if ":" in ps:
+                    tips.append(("Correct score", ps.replace(":", "-")))
+                for market, pick in tips:
+                    con.execute("INSERT OR REPLACE INTO site_tips VALUES (?,?,?,?)",
+                                (match_id, "soccervista.com", market, pick))
+    return n
+
+
+def fetch_day(d: date) -> int:
+    n = fetch_fotmob(d)
+    try:
+        n += fetch_soccervista(d)
+    except requests.RequestException:
+        pass
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    con = connect()
+    with con:
         con.execute("INSERT INTO fetch_log VALUES (?,?,?) ON CONFLICT(match_date) DO UPDATE SET "
                     "fetched_at=excluded.fetched_at, n_matches=excluded.n_matches", (d.isoformat(), now, n))
     return n
@@ -93,26 +213,7 @@ def refresh(back: int = 7, ahead: int = 7, force: bool = False) -> list[str]:
             fetched.append(d.isoformat())
         except requests.RequestException:
             continue
-    load_picks()
     return fetched
-
-
-def load_picks() -> int:
-    """Load tipster-consensus editions (data/picks/eNNN.json) into tipster_picks."""
-    con = connect()
-    n = 0
-    with con:
-        for f in sorted(PICKS_DIR.glob("picks_e*.json")):
-            ed = json.loads(f.read_text(encoding="utf-8"))
-            for p in ed.get("topTen", []):
-                con.execute(
-                    "INSERT OR REPLACE INTO tipster_picks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (ed["n"], p["market"], p["home"], p["away"], p.get("league"), p.get("conf"),
-                     p.get("gender"), p.get("date"), p.get("time"), p["pick"], p["agree"], p["of"],
-                     ", ".join(p.get("sources", [])), p.get("flag")),
-                )
-                n += 1
-    return n
 
 
 if __name__ == "__main__":

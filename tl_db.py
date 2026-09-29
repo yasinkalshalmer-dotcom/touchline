@@ -54,8 +54,27 @@ CREATE TABLE IF NOT EXISTS tipster_picks (
 """
 
 
+MIGRATIONS = {
+    "matches": {"source": "TEXT", "home_form": "TEXT", "away_form": "TEXT", "country_name": "TEXT"},
+}
+EXTRA = """
+CREATE TABLE IF NOT EXISTS site_tips (
+    match_id INTEGER,
+    source   TEXT,
+    market   TEXT,
+    pick     TEXT,
+    PRIMARY KEY (match_id, source, market)
+);
+"""
+
+
 def connect() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(DB_PATH, check_same_thread=False)
-    con.executescript(SCHEMA)
+    con.executescript(SCHEMA + EXTRA)
+    for table, cols in MIGRATIONS.items():
+        have = {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
+        for col, typ in cols.items():
+            if col not in have:
+                con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
     return con

@@ -47,3 +47,31 @@ def confederation(ccode: str, name: str) -> str:
 
 def gender(name: str) -> str:
     return "women" if _WOMEN.search(name or "") else "men"
+
+
+# ISO 3166-1 alpha-2 codes (as used by SoccerVista) per confederation.
+_ISO2 = {
+    "uefa": "AL AD AM AT AZ BY BE BA BG HR CY CZ DK EE FO FI FR GE DE GI GR HU IS IL IT KZ XK LV LI LT LU MT MD ME NL "
+            "MK NO PL PT IE RO RU SM RS SK SI ES SE CH TR UA GB",
+    "conmebol": "AR BO BR CL CO EC PY PE UY VE",
+    "concacaf": "AI AG AW BS BB BZ BM BQ VG CA KY CR CU CW DM DO SV GF GD GP GT GY HT HN JM MQ MX MS NI PA PR KN LC MF "
+                "VC SX SR TT TC VI US",
+    "caf": "DZ AO BJ BW BF BI CV CM CF TD KM CG CD CI DJ EG GQ ER SZ ET GA GM GH GN GW KE LS LR LY MG MW ML MR MU MA MZ "
+           "NA NE NG RW ST SN SC SL SO ZA SS SD TZ TG TN UG ZM ZW RE",
+    "afc": "AF AU BH BD BT BN KH CN TW KP GU HK IN ID IR IQ JP JO KR KW KG LA LB MO MY MV MN MM NP OM PK PS PH QA SA SG LK "
+           "SY TJ TH TL TM AE UZ VN YE MP",
+    "ofc": "AS CK FJ NC NZ PG WS SB PF TO VU",
+}
+ISO2_CONF = {cc: conf for conf, codes in _ISO2.items() for cc in codes.split()}
+_REGION_CONF = {"europe": "uefa", "africa": "caf", "asia": "afc", "south america": "conmebol",
+                "north & central america": "concacaf", "australia & oceania": "ofc", "oceania": "ofc",
+                "england": "uefa", "scotland": "uefa", "wales": "uefa", "northern ireland": "uefa", "world": "int"}
+
+
+def confederation_iso2(code: str, country: str, comp: str) -> str:
+    if code and code.upper() in ISO2_CONF:
+        return ISO2_CONF[code.upper()]
+    region = _REGION_CONF.get((country or "").lower())
+    if region and region != "int":
+        return region
+    return confederation("", f"{country} {comp}")

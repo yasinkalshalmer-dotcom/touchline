@@ -30,18 +30,19 @@ def stamp(minutes: int) -> str:
 
 
 @st.cache_data(ttl=600, show_spinner="Updating fixtures and results…")
-def load_matches(_stamp: str) -> tuple[pd.DataFrame, str]:
+def load_matches(_stamp: str) -> tuple[pd.DataFrame, str, pd.DataFrame]:
     refresh()
     con = connect()
     m = pd.read_sql_query(
-        "SELECT m.*, c.name AS competition, c.country_code AS country, c.confederation, c.gender "
+        "SELECT m.*, c.name AS competition, COALESCE(m.country_name, c.country_code) AS country, c.confederation, c.gender "
         "FROM matches m JOIN competitions c ON c.id = m.competition_id", con)
     last = con.execute("SELECT MAX(fetched_at) FROM fetch_log").fetchone()[0] or ""
-    return m, last
+    site = pd.read_sql_query("SELECT match_id, source, market, pick FROM site_tips", con)
+    return m, last, site
 
 
 @st.cache_data(ttl=3600, show_spinner="Reading tipster sites and matching their picks…")
-def load_tips(_stamp: str, fixtures: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+def load_tips(_stamp: str, fixtures: pd.DataFrame, site_tips: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     today = datetime.now(timezone.utc).date()
     days = [today + timedelta(days=o) for o in range(-7, 4)]
     with ThreadPoolExecutor(max_workers=4) as ex:
@@ -54,11 +55,16 @@ def load_tips(_stamp: str, fixtures: pd.DataFrame) -> tuple[pd.DataFrame, pd.Dat
     recs.extend(tipsters.manual_editions(HERE))
     tips = pd.DataFrame(recs, columns=["source", "date", "home", "away", "market", "pick"])
     tips = tipsters.attach(tips, fixtures)
+    site = site_tips.merge(fixtures[["id", "match_date", "home", "away"]], left_on="match_id", right_on="id")
+    if not site.empty:
+        site = site.rename(columns={"match_date": "date"})[["source", "date", "home", "away", "market", "pick", "match_id"]]
+        tips = pd.concat([tips, site], ignore_index=True)
+        status["soccervista"] = len(site)
     return tips, tipsters.consensus(tips), status
 
 
-matches, last_fetch = load_matches(stamp(10))
-tips, cons, src_status = load_tips(stamp(60), matches[["id", "match_date", "home", "away"]])
+matches, last_fetch, site_tips_df = load_matches(stamp(10))
+tips, cons, src_status = load_tips(stamp(60), matches[["id", "match_date", "home", "away"]], site_tips_df)
 
 # ---------- sidebar ----------
 with st.sidebar:
@@ -179,6 +185,8 @@ with t_fx:
     day["Consensus"] = day["id"].map(bp).fillna("")
     day["Top tip"] = day["id"].map(allbp).fillna("")
     day["Score"] = day.apply(score, axis=1)
+    day["Home form"] = day["home_form"].fillna("").str[::-1]
+    day["Away form"] = day["away_form"].fillna("")
     k = st.columns(4)
     k[0].metric("Matches", len(day))
     k[1].metric("To play", int((day["status"] == "NS").sum()))
@@ -187,7 +195,7 @@ with t_fx:
     if only:
         day = day[day["Consensus"] != ""]
     day = day.assign(_c=day["Consensus"] != "", _t=day["Top tip"] != "").sort_values(["_c", "_t", "Time"], ascending=[False, False, True])
-    st.dataframe(day[["Time", "Conf", "country", "competition", "home", "Score", "away", "status", "Consensus", "Top tip"]]
+    st.dataframe(day[["Time", "Conf", "country", "competition", "Home form", "home", "Score", "away", "Away form", "status", "Consensus", "Top tip"]]
                  .rename(columns={"country": "Country", "competition": "Competition", "home": "Home", "away": "Away", "status": "Status"}),
                  hide_index=True, width="stretch", height=min(36 * len(day) + 40, 760))
 
