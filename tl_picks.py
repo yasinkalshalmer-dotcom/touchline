@@ -31,6 +31,15 @@ def grade(market: str, pick: str, hs, as_):
         if pick.lower().startswith("draw"):
             return hs == as_
         return None
+    if market == "Double chance":
+        p = pick.lower()
+        if p.startswith("home or draw"):
+            return hs >= as_
+        if p.startswith("draw or away"):
+            return as_ >= hs
+        if p.startswith("home or away"):
+            return hs != as_
+        return None
     if market == "Over/Under goals":
         m = re.search(r"(over|under)\s*([\d.]+)", pick, re.I)
         if not m:
